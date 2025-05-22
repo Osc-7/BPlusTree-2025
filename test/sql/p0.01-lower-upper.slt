@@ -1,0 +1,20 @@
+query rowsort
+select upper('DB');
+----
+DB
+
+query rowsort
+select lower('DB');
+----
+DB
+
+query rowsort
+select lower('DB'), '|', upper('DB');
+----
+DB | DB
+
+
+query rowsort
+select lower(upper(upper(lower(lower('DB'))))), '|', upper(upper(lower(lower('DB'))));
+----
+DB | DB
