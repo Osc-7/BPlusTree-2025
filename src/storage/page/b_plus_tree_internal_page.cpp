@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-//                         DB Project 
-//                        
+//                         DB Project
+//
 //
 // Identification: src/page/b_plus_tree_internal_page.cpp
 //
-// 
+//
 //
 //===----------------------------------------------------------------------===//
 
@@ -73,6 +73,19 @@ void B_PLUS_TREE_INTERNAL_PAGE_TYPE::SetValueAt(int index,
                                                 const ValueType& value)
 {
   array_[index].second = value;
+}
+INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_INTERNAL_PAGE_TYPE::ValueIndex(const ValueType& value) const
+    -> int
+{
+  for (int i = 0; i <= GetSize(); ++i)
+  {
+    if (array_[i].second == value)
+    {
+      return i;
+    }
+  }
+  return -1;
 }
 
 // valuetype for internalNode should be page id_t
