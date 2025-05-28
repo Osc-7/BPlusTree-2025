@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-//                         DB Project 
-//                        
+//                         DB Project
+//
 //
 // Identification: src/page/b_plus_tree_page.cpp
 //
-// 
+//
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,23 +54,17 @@ auto BPlusTreePage::GetMinSize() const -> int
     {
       return temp;
     }
-    else
-    {
-      return 1;
-    }
+
+    return 1;
   }
-  else
+
+  int temp = (max_size_ + 1) / 2;
+  if (temp > 1)
   {
-    int temp = (max_size_ + 1) / 2;
-    if (temp > 1)
-    {
-      return temp;
-    }
-    else
-    {
-      return 2;
-    }
+    return temp;
   }
+
+  return 2;
 }
 
 }  // namespace bustub

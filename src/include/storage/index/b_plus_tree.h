@@ -95,6 +95,8 @@ class BPlusTree
   auto FindLeafPage(const KeyType& key, Operation op, Context& ctx);
   auto IsSafePage(const BPlusTreePage* tree_page, Operation op,
                   bool isRootPage = false) -> bool;
+  auto SplitLeafPage(LeafPage* leaf, Context& ctx)
+      -> std::pair<KeyType, page_id_t>;
 
   public:
   explicit BPlusTree(std::string name, page_id_t header_page_id,

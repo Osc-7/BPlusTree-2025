@@ -1,5 +1,7 @@
 #include "storage/index/b_plus_tree.h"
 
+#include <cstddef>
+#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -119,14 +121,58 @@ auto BPLUSTREE_TYPE::FindLeafPage(const KeyType& key, Operation op,
       ctx.read_set_.push_back(std::move(child_guard));
     }
   }
+  else if (op == Operation::Insert || op == Operation::Remove)
+  {
+    auto page = ctx.write_set_.back().As<BPlusTreePage>();
+    while (!page->IsLeafPage())
+    {
+      auto internal = ctx.write_set_.back().As<InternalPage>();
+      auto next_page_id = internal->ValueAt(BinaryFind(internal, key));
+      ctx.write_set_.push_back(bpm_->FetchPageWrite(next_page_id));
+      if (IsSafePage(ctx.write_set_.back().template As<BPlusTreePage>(), op,
+                     false))
+      {
+        while (ctx.write_set_.size() > 1)
+        {
+          ctx.write_set_.pop_front();
+        }
+      }  // child is safe
+      page = ctx.write_set_.back().template As<BPlusTreePage>();
+    }
+    return;
+  }
 }
 
 INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::IsSafePage(const BPlusTreePage* tree_page, Operation op,
                                 bool isRootPage) -> bool
 {
-  return true;
-};
+  if (op == Operation::Search)
+  {
+    return true;
+  }
+  if (op == Operation::Insert)
+  {
+    if (tree_page->IsLeafPage())
+    {
+      return tree_page->GetSize() + 1 < tree_page->GetMaxSize();
+    }
+    return tree_page->GetSize() < tree_page->GetMaxSize();
+  }
+  if (op == Operation::Remove)
+  {  // 删了之后仍安全
+    if (isRootPage)
+    {
+      if (tree_page->IsLeafPage())
+      {
+        return tree_page->GetSize() > 1;
+      }
+      return tree_page->GetSize() > 2;
+    }
+    return tree_page->GetSize() > tree_page->GetMinSize();
+  }
+  return false;
+}
 /*****************************************************************************
  * INSERTION
  *****************************************************************************/
@@ -142,72 +188,241 @@ INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn) -> bool
 {
-  // 获取 header page
-  WritePageGuard header_guard = bpm_->FetchPageWrite(header_page_id_);
-  auto header_page = header_guard.template AsMut<BPlusTreeHeaderPage>();
-
   Context ctx;
-  ctx.root_page_id_ = header_page->root_page_id_;
 
-  if (ctx.root_page_id_ == INVALID_PAGE_ID)
+  // 获取header page并保留写锁
+  WritePageGuard header_guard = bpm_->FetchPageWrite(header_page_id_);
+  auto* header_page = header_guard.template AsMut<BPlusTreeHeaderPage>();
+  ctx.header_page_ = std::move(header_guard);
+
+  // 空树情况处理
+  if (header_page->root_page_id_ == INVALID_PAGE_ID)
   {
-    // 空树，初始化 root 为新的叶子页
-    page_id_t new_leaf_id;
-    auto new_leaf_guard = bpm_->NewPageGuarded(&new_leaf_id).UpgradeWrite();
-    auto new_leaf = new_leaf_guard.template AsMut<LeafPage>();
+    auto new_leaf_guard = bpm_->NewPageGuarded(&ctx.root_page_id_);
+    header_page->root_page_id_ = ctx.root_page_id_;
+
+    auto* new_leaf = new_leaf_guard.template AsMut<LeafPage>();
+
     new_leaf->Init(leaf_max_size_);
-    new_leaf->SetNextPageId(INVALID_PAGE_ID);
+    new_leaf->SetSize(1);
     new_leaf->SetKeyAt(0, key);
     new_leaf->SetValueAt(0, value);
-    new_leaf->SetSize(1);
-
-    header_page->root_page_id_ = new_leaf_id;
+    ctx.Drop();
     return true;
   }
-
-  // 否则，正常插入
-  auto read_guard = bpm_->FetchPageRead(ctx.root_page_id_);
-  ctx.read_set_.push_back(std::move(read_guard));
-
-  FindLeafPage(key, Operation::Search, ctx);
-  auto leaf_guard = std::move(ctx.read_set_.back());
-  const auto* leaf_page = leaf_guard.template As<LeafPage>();
-
-  // 查重
-  int idx = BinaryFind(leaf_page, key);
-  if (idx != -1 && comparator_(leaf_page->KeyAt(idx), key) == 0)
+  ctx.root_page_id_ = header_page->root_page_id_;
+  // 获取root页并查找叶子节点
+  ctx.write_set_.push_back(bpm_->FetchPageWrite(ctx.root_page_id_));
+  if (IsSafePage(ctx.write_set_.back().As<BPlusTreePage>(), Operation::Insert,
+                 true))
   {
-    return false;  // duplicate key
+    ctx.header_page_ = std::nullopt;  // unlock header_page
+  }
+  FindLeafPage(key, Operation::Insert, ctx);
+
+  auto& leaf_guard = ctx.write_set_.back();
+  auto* leaf = leaf_guard.template AsMut<LeafPage>();
+
+  // 检查键是否已存在
+  int idx = BinaryFind(leaf, key);
+  if (idx != -1 && comparator_(leaf->KeyAt(idx), key) == 0)
+  {
+    return false;  // 键已存在
   }
 
-  // 将 page 升级为可写
-  auto writable_leaf_guard = bpm_->FetchPageWrite(leaf_guard.PageId());
-  auto leaf = writable_leaf_guard.template AsMut<LeafPage>();
-
-  // 插入到合适位置（从右向左挪动）
+  // 插入新键值
   int size = leaf->GetSize();
-  int insert_idx = 0;
-  while (insert_idx < size && comparator_(leaf->KeyAt(insert_idx), key) < 0)
-  {
-    insert_idx++;
-  }
-
-  for (int i = size; i > insert_idx; i--)
+  idx++;
+  leaf->IncreaseSize(1);
+  // 移动元素腾出空间
+  for (int i = size; i > idx; --i)
   {
     leaf->SetKeyAt(i, leaf->KeyAt(i - 1));
     leaf->SetValueAt(i, leaf->ValueAt(i - 1));
   }
+  leaf->SetKeyAt(idx, key);
+  leaf->SetValueAt(idx, value);
 
-  leaf->SetKeyAt(insert_idx, key);
-  leaf->SetValueAt(insert_idx, value);
-  leaf->SetSize(size + 1);
+  // 检查是否需要分裂
+  if (leaf->GetSize() >= leaf->GetMaxSize())
+  {
+    auto [push_up_key, new_leaf_id] = SplitLeafPage(leaf, ctx);
+
+    InsertIntoParent(push_up_key, new_leaf_id, ctx,
+                     static_cast<int>(ctx.write_set_.size()) - 2);
+  }
+
+  ctx.Drop();  // 正常执行后释放锁
   return true;
 }
 
 INDEX_TEMPLATE_ARGUMENTS
+auto BPLUSTREE_TYPE::SplitLeafPage(LeafPage* leaf, Context& ctx)
+    -> std::pair<KeyType, page_id_t>
+{
+  page_id_t new_page_id = 0;
+  auto new_page_guard = bpm_->NewPageGuarded(&new_page_id);
+  auto* new_leaf = new_page_guard.template AsMut<LeafPage>();
+
+  leaf->SetNextPageId(new_page_guard.PageId());
+
+  new_leaf->Init(leaf_max_size_);
+  new_leaf->SetSize(leaf->GetSize() - leaf->GetMinSize());
+  new_leaf->SetNextPageId(leaf->GetNextPageId());
+
+  int total_size = leaf->GetSize();
+  int move_start = leaf->GetMinSize();
+
+  // 移动后半部分到新节点
+  for (int i = move_start; i < total_size; i++)
+  {
+    new_leaf->SetKeyAt(i - move_start, leaf->KeyAt(i));
+    new_leaf->SetValueAt(i - move_start, leaf->ValueAt(i));
+  }
+
+  leaf->SetSize(move_start);
+
+  return {new_leaf->KeyAt(0), new_page_guard.PageId()};
+}
+
+INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::InsertIntoParent(const KeyType& key,
-                                      page_id_t right_child_id, Context& ctx,
-                                      int index){};
+                                      page_id_t new_child_id, Context& ctx,
+                                      int parent_index)
+{
+  // Case 1: 需要创建新根节点
+  if (parent_index < 0)
+  {
+    // 创建新根节点
+    page_id_t new_root_id = INVALID_PAGE_ID;
+    auto new_root_guard = bpm_->NewPageGuarded(&new_root_id);
+    auto* new_root = new_root_guard.template AsMut<InternalPage>();
+
+    new_root->Init(internal_max_size_);
+    new_root->SetSize(2);  // 新根节点有两个子节点
+
+    // 设置新根节点的内容
+    new_root->SetValueAt(
+        0, ctx.write_set_[parent_index + 1].PageId());  // 左子节点
+    new_root->SetKeyAt(1, key);                         // 分裂键
+    new_root->SetValueAt(1, new_child_id);              // 右子节点
+
+    auto header_page = ctx.header_page_->template AsMut<BPlusTreeHeaderPage>();
+    header_page->root_page_id_ = new_root_id;
+
+    // 更新上下文中的root_page_id
+    // ctx.root_page_id_ = new_root_id;
+    return;
+  }
+
+  // 获取父节点
+  auto& parent_guard = ctx.write_set_[parent_index];
+  auto* parent = parent_guard.template AsMut<InternalPage>();
+
+  // Case 2: 父节点有空间，直接插入
+  if (parent->GetSize() < parent->GetMaxSize())
+  {
+    // 找到插入位置
+    int insert_pos = BinaryFind(parent, key) + 1;
+
+    // 移动元素腾出空间
+    parent->IncreaseSize(1);
+    for (int i = parent->GetSize() - 1; i > insert_pos; --i)
+    {
+      parent->SetKeyAt(i, parent->KeyAt(i - 1));
+      parent->SetValueAt(i, parent->ValueAt(i - 1));
+    }
+
+    // 插入新键值对
+    parent->SetKeyAt(insert_pos, key);
+    parent->SetValueAt(insert_pos, new_child_id);
+    return;
+  }
+
+  // Case 3: 父节点已满，需要分裂
+  page_id_t new_parent_id = INVALID_PAGE_ID;
+  auto new_parent_guard = bpm_->NewPageGuarded(&new_parent_id);
+  auto* new_parent = new_parent_guard.template AsMut<InternalPage>();
+  new_parent->Init(internal_max_size_);
+
+  // 计算分裂位置
+  int split_pos = parent->GetMinSize();
+  int insert_pos = BinaryFind(parent, key) + 1;
+  new_parent->SetSize(parent->GetMaxSize() + 1 - split_pos);
+
+  // 根据插入位置决定分裂方式
+  if (insert_pos < split_pos)
+  {
+    // 新键插入到左半部分
+    // 复制右半部分到新节点
+    for (int i = split_pos; i < parent->GetSize(); ++i)
+    {
+      new_parent->SetKeyAt(i - split_pos + 1, parent->KeyAt(i));
+      new_parent->SetValueAt(i - split_pos + 1, parent->ValueAt(i));
+    }
+
+    // 设置新节点的第一个子节点
+    new_parent->SetKeyAt(0, parent->KeyAt(split_pos - 1));
+    new_parent->SetValueAt(0, parent->ValueAt(split_pos - 1));
+
+    // 在左节点中插入新键
+    for (int i = split_pos - 1; i > insert_pos; --i)
+    {
+      parent->SetKeyAt(i, parent->KeyAt(i - 1));
+      parent->SetValueAt(i, parent->ValueAt(i - 1));
+    }
+    parent->SetKeyAt(insert_pos, key);
+    parent->SetValueAt(insert_pos, new_child_id);
+  }
+  else if (insert_pos == split_pos)
+  {
+    // 新键正好在分裂位置
+    // 复制右半部分到新节点
+    for (int i = split_pos; i < parent->GetSize(); ++i)
+    {
+      new_parent->SetKeyAt(i - split_pos + 1, parent->KeyAt(i));
+      new_parent->SetValueAt(i - split_pos + 1, parent->ValueAt(i));
+    }
+
+    // 设置新节点的第一个子节点为新插入的子节点
+    new_parent->SetValueAt(0, new_child_id);
+    new_parent->SetKeyAt(0, key);
+  }
+  else
+  {
+    // 新键插入到右半部分
+    // 复制右半部分到新节点（不包括新键）
+    for (int i = split_pos; i < parent->GetSize(); ++i)
+    {
+      new_parent->SetKeyAt(i - split_pos, parent->KeyAt(i));
+      new_parent->SetValueAt(i - split_pos, parent->ValueAt(i));
+    }
+
+    // // 设置新节点的第一个子节点
+    new_parent->SetKeyAt(0, parent->KeyAt(split_pos));
+    new_parent->SetValueAt(0, parent->ValueAt(split_pos));
+
+    // 在新节点中插入新键
+    insert_pos -= split_pos;
+    for (int i = new_parent->GetSize(); i > insert_pos; --i)
+    {
+      new_parent->SetKeyAt(i, new_parent->KeyAt(i - 1));
+      new_parent->SetValueAt(i, new_parent->ValueAt(i - 1));
+    }
+    new_parent->SetKeyAt(insert_pos, key);
+    new_parent->SetValueAt(insert_pos, new_child_id);
+  }
+
+  // 更新节点大小
+  parent->SetSize(split_pos);
+
+  // 向上传递新节点的第一个键
+  KeyType push_up_key = new_parent->KeyAt(0);
+
+  // 递归处理父节点
+  InsertIntoParent(push_up_key, new_parent_id, ctx, parent_index - 1);
+}
+
 /*****************************************************************************
  * REMOVE
  *****************************************************************************/
