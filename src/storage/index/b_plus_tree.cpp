@@ -437,13 +437,278 @@ void BPLUSTREE_TYPE::InsertIntoParent(const KeyType& key,
 INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
 {
-  // Your code here
+  Context ctx;
+  ctx.header_page_ = bpm_->FetchPageWrite(header_page_id_);
+  auto header_page = ctx.header_page_->AsMut<BPlusTreeHeaderPage>();
+
+  // 空树直接返回
+  if (header_page->root_page_id_ == INVALID_PAGE_ID)
+  {
+    return;
+  }
+
+  // 获取根页面并加入写集合
+  ctx.root_page_id_ = header_page->root_page_id_;
+  ctx.write_set_.push_back(bpm_->FetchPageWrite(ctx.root_page_id_));
+
+  // 如果根页面删除后不会下溢，可以释放头页面的锁
+  if (IsSafePage(ctx.write_set_.back().As<BPlusTreePage>(), Operation::Remove,
+                 true))
+  {
+    ctx.header_page_ = std::nullopt;
+  }
+
+  // 查找包含key的叶子页面
+  FindLeafPage(key, Operation::Remove, ctx);
+  auto& leaf_page_guard = ctx.write_set_.back();
+  auto leaf_page = leaf_page_guard.AsMut<LeafPage>();
+
+  // 查找key在叶子页面中的位置
+  int pos = BinaryFind(leaf_page, key);
+  if (pos == -1 || comparator_(leaf_page->KeyAt(pos), key) != 0)
+  {
+    // key不存在
+    ctx.Drop();
+    return;
+  }
+
+  // 执行删除操作 - 移动后续元素向前填补
+  for (int i = pos + 1; i < leaf_page->GetSize(); ++i)
+  {
+    leaf_page->SetAt(i - 1, leaf_page->KeyAt(i), leaf_page->ValueAt(i));
+  }
+  leaf_page->SetSize(leaf_page->GetSize() - 1);
+
+  // 检查删除后是否下溢
+  if (leaf_page->GetSize() >= leaf_page->GetMinSize())
+  {
+    ctx.Drop();
+    return;
+  }
+
+  // 处理下溢情况
+  if (ctx.IsRootPage(leaf_page_guard.PageId()))
+  {
+    // 如果是根节点且为空，将树置为空
+    if (leaf_page->GetSize() == 0)
+    {
+      header_page->root_page_id_ = INVALID_PAGE_ID;
+    }
+    ctx.Drop();
+    return;
+  }
+
+  // 获取父节点
+  auto& parent_page_guard = ctx.write_set_[ctx.write_set_.size() - 2];
+  auto parent_page = parent_page_guard.AsMut<InternalPage>();
+  int index = BinaryFind(parent_page, key);  // 找到当前节点在父节点中的索引
+
+  // 优先尝试与右兄弟合并或借元素
+  if (index < parent_page->GetSize() - 1)
+  {
+    page_id_t right_page_id = parent_page->ValueAt(index + 1);
+    auto right_page_guard = bpm_->FetchPageWrite(right_page_id);
+    auto right_page = right_page_guard.AsMut<LeafPage>();
+
+    // 检查是否可以合并
+    if (leaf_page->GetSize() + right_page->GetSize() < leaf_page->GetMaxSize())
+    {
+      // 合并到当前节点
+      int original_size = leaf_page->GetSize();
+      leaf_page->SetSize(original_size + right_page->GetSize());
+      for (int i = 0; i < right_page->GetSize(); ++i)
+      {
+        leaf_page->SetAt(original_size + i, right_page->KeyAt(i),
+                         right_page->ValueAt(i));
+      }
+      leaf_page->SetNextPageId(right_page->GetNextPageId());
+
+      RemoveFromParent(index + 1, ctx, ctx.write_set_.size() - 2);
+    }
+    else
+    {
+      // 从右兄弟借一个元素
+      leaf_page->IncreaseSize(1);
+      leaf_page->SetAt(leaf_page->GetSize() - 1, right_page->KeyAt(0),
+                       right_page->ValueAt(0));
+
+      // 移动右兄弟的元素
+      for (int i = 1; i < right_page->GetSize(); ++i)
+      {
+        right_page->SetAt(i - 1, right_page->KeyAt(i), right_page->ValueAt(i));
+      }
+      right_page->IncreaseSize(-1);
+
+      // 更新父节点的key
+      parent_page->SetKeyAt(index + 1, right_page->KeyAt(0));
+    }
+  }
+  else
+  {
+    // 没有右兄弟，尝试与左兄弟合并或借元素
+    page_id_t left_page_id = parent_page->ValueAt(index - 1);
+    auto left_page_guard = bpm_->FetchPageWrite(left_page_id);
+    auto left_page = left_page_guard.AsMut<LeafPage>();
+
+    // 检查是否可以合并
+    if (left_page->GetSize() + leaf_page->GetSize() < left_page->GetMaxSize())
+    {
+      // 合并到左兄弟
+      int original_size = left_page->GetSize();
+      left_page->SetSize(original_size + leaf_page->GetSize());
+      for (int i = 0; i < leaf_page->GetSize(); ++i)
+      {
+        left_page->SetAt(original_size + i, leaf_page->KeyAt(i),
+                         leaf_page->ValueAt(i));
+      }
+      left_page->SetNextPageId(leaf_page->GetNextPageId());
+
+      RemoveFromParent(index, ctx, ctx.write_set_.size() - 2);
+    }
+    else
+    {
+      // 从左兄弟借一个元素
+      // 为借来的元素腾出空间
+      for (int i = leaf_page->GetSize(); i > 0; --i)
+      {
+        leaf_page->SetAt(i, leaf_page->KeyAt(i - 1), leaf_page->ValueAt(i - 1));
+      }
+
+      // 从左兄弟借最后一个元素
+      leaf_page->SetAt(0, left_page->KeyAt(left_page->GetSize() - 1),
+                       left_page->ValueAt(left_page->GetSize() - 1));
+      leaf_page->IncreaseSize(1);
+      left_page->IncreaseSize(-1);
+
+      // 更新父节点的key
+      parent_page->SetKeyAt(index, leaf_page->KeyAt(0));
+    }
+  }
+
+  ctx.Drop();
 }
 
 INDEX_TEMPLATE_ARGUMENTS
-void BPLUSTREE_TYPE::RemoveFromParent(int valueIndex, Context& ctx,
-                                      int index){};
+void BPLUSTREE_TYPE::RemoveFromParent(int valueIndex, Context& ctx, int index)
+{
+  auto& page_guard = ctx.write_set_[index];
+  auto page = page_guard.AsMut<InternalPage>();
 
+  // 移动元素填补空缺
+  for (int i = valueIndex + 1; i < page->GetSize(); ++i)
+  {
+    page->SetKeyAt(i - 1, page->KeyAt(i));
+    page->SetValueAt(i - 1, page->ValueAt(i));
+  }
+  page->IncreaseSize(-1);
+
+  // 检查是否下溢
+  if (page->GetSize() >= page->GetMinSize())
+  {
+    return;
+  }
+
+  // 处理内部节点的下溢
+  if (ctx.IsRootPage(page_guard.PageId()))
+  {
+    // 如果是根节点且只有一个孩子，降低树的高度
+    if (page->GetSize() == 1)
+    {
+      auto header_page = ctx.header_page_->AsMut<BPlusTreeHeaderPage>();
+      header_page->root_page_id_ = page->ValueAt(0);
+
+      // 更新新根节点的父指针
+      // auto new_root_guard = bpm_->FetchPageWrite(header_page->root_page_id_);
+      // auto new_root = new_root_guard.AsMut<BPlusTreePage>();
+    }
+    return;
+  }
+
+  // 获取父节点
+  auto& parent_page_guard = ctx.write_set_[index - 1];
+  auto parent_page = parent_page_guard.AsMut<InternalPage>();
+  int pos = parent_page->ValueIndex(page_guard.PageId());
+
+  // 优先尝试与右兄弟合并或借元素
+  if (pos < parent_page->GetSize() - 1)
+  {
+    page_id_t right_page_id = parent_page->ValueAt(pos + 1);
+    auto right_page_guard = bpm_->FetchPageWrite(right_page_id);
+    auto right_page = right_page_guard.AsMut<InternalPage>();
+
+    // 检查是否可以合并
+    if (page->GetSize() + right_page->GetSize() <= page->GetMaxSize())
+    {
+      // 合并到当前节点
+      for (int i = 0; i < right_page->GetSize(); ++i)
+      {
+        page->SetKeyAt(page->GetSize(), right_page->KeyAt(i));
+        page->SetValueAt(page->GetSize(), right_page->ValueAt(i));
+        page->IncreaseSize(1);
+      }
+
+      RemoveFromParent(pos + 1, ctx, index - 1);
+    }
+    else
+    {
+      // 从右兄弟借一个元素
+      page->SetKeyAt(page->GetSize(), right_page->KeyAt(0));
+      page->SetValueAt(page->GetSize(), right_page->ValueAt(0));
+      page->IncreaseSize(1);
+
+      // 移动右兄弟的元素
+      for (int i = 1; i < right_page->GetSize(); ++i)
+      {
+        right_page->SetKeyAt(i - 1, right_page->KeyAt(i));
+        right_page->SetValueAt(i - 1, right_page->ValueAt(i));
+      }
+      right_page->IncreaseSize(-1);
+
+      // 更新父节点的key
+      parent_page->SetKeyAt(pos + 1, right_page->KeyAt(0));
+    }
+  }
+  else
+  {
+    // 没有右兄弟，尝试与左兄弟合并或借元素
+    page_id_t left_page_id = parent_page->ValueAt(pos - 1);
+    auto left_page_guard = bpm_->FetchPageWrite(left_page_id);
+    auto left_page = left_page_guard.AsMut<InternalPage>();
+
+    // 检查是否可以合并
+    if (left_page->GetSize() + page->GetSize() <= left_page->GetMaxSize())
+    {
+      // 合并到左兄弟
+      for (int i = 0; i < page->GetSize(); ++i)
+      {
+        left_page->SetKeyAt(left_page->GetSize(), page->KeyAt(i));
+        left_page->SetValueAt(left_page->GetSize(), page->ValueAt(i));
+        left_page->IncreaseSize(1);
+      }
+
+      RemoveFromParent(pos, ctx, index - 1);
+    }
+    else
+    {
+      // 从左兄弟借一个元素
+      // 为借来的元素腾出空间
+      for (int i = page->GetSize(); i > 0; --i)
+      {
+        page->SetKeyAt(i, page->KeyAt(i - 1));
+        page->SetValueAt(i, page->ValueAt(i - 1));
+      }
+
+      // 从左兄弟借最后一个元素
+      page->SetKeyAt(0, left_page->KeyAt(left_page->GetSize() - 1));
+      page->SetValueAt(0, left_page->ValueAt(left_page->GetSize() - 1));
+      page->IncreaseSize(1);
+      left_page->IncreaseSize(-1);
+
+      // 更新父节点的key
+      parent_page->SetKeyAt(pos, page->KeyAt(0));
+    }
+  }
+}
 /*****************************************************************************
  * INDEX ITERATOR
  *****************************************************************************/
